@@ -10,7 +10,9 @@ import org.jetbrains.annotations.Nullable;
 
 import javax.annotation.ParametersAreNonnullByDefault;
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.LinkedList;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
@@ -18,16 +20,17 @@ import java.util.regex.Pattern;
 @ParametersAreNonnullByDefault
 
 public class Main {
+
+    public static final Gson prettyGson = new GsonBuilder().setPrettyPrinting().create();
     public static final String URL_HEAD = "https://api.telegram.org/bot";
     public static final Options options = new Options()
             .addOption("h", "help", false, "do nothing but print usage.")
             .addOption("t", "token", true, "token from bot father")
-            .addOption("g", "group", true, "group id or @Username(ignore case).\n"+
+            .addOption("g", "group", true, "group id or @Username(ignore case).\n" +
                     "bot will only works in these group.\ncan be a regex(case sensitive), or split by \",\" or \"，\"")
-            .addOption("c","continue",true,"continue count from a number(last sent).")
-            .addOption("i", "ignore", true, "a white list of uid or @Username(ignore case).\n"+
+            .addOption("i", "ignore", true, "a white list of uid or @Username(ignore case).\n" +
                     "bot will do nothing to their message. \ncan be a regex(case sensitive), or split by \",\" or \"，\"")
-            .addOption(null,"keep-service-message",false, "keep service message like \"xxx joined group\"")
+            .addOption(null, "keep-service-message", false, "keep service message like \"xxx joined group\"")
             .addOption("v", "verbose", false, "show more information.");
 
     private static final OkHttpClient updateClient = new OkHttpClient.Builder().readTimeout(120, TimeUnit.SECONDS).build();
@@ -35,6 +38,10 @@ public class Main {
 
     private static String token;
     private static boolean verbose = false;
+
+    private static final Map<String, Long> latestCounts = new HashMap<>();
+    private static final Map<String, String> latestCounterIDs = new HashMap<>();
+    private static final Map<String, Boolean> rollBackTags = new HashMap<>();
 
     public static void main(String[] args) {
 
@@ -55,9 +62,7 @@ public class Main {
         token = commandLine.getOptionValue("t");
         final String whiteUser = commandLine.getOptionValue("i");
         final boolean deleteServiceMessage = !commandLine.hasOption("keep-service-message");
-        final String continueNumber = commandLine.getOptionValue("c");
-        long latestCount = continueNumber==null ? -1 : Long.parseLong(continueNumber, 16);
-        @Nullable String latestCounterID = null;
+
         verbose = commandLine.hasOption("v");
 
 
@@ -78,13 +83,12 @@ public class Main {
                 getCheckFunctionByArgument(whiteUser);
 
 
-
         int offset = 0;
         JsonArray result;
         // update loop
         while (true) {
 
-            if(verbose){
+            if (verbose) {
                 System.out.println("getting Updates...");
             }
             try {
@@ -95,14 +99,14 @@ public class Main {
                                 .post(
                                         new FormBody.Builder()
                                                 .add("timeout", "110")
-                                                .add("offset", String.valueOf(offset+1))
+                                                .add("offset", String.valueOf(offset + 1))
                                                 .build()
                                 )
                                 .build()
                 ).execute();
                 JsonObject responseBody = new Gson().fromJson(response.body().string(), JsonObject.class);
-                if(verbose){
-                    System.out.println(new GsonBuilder().setPrettyPrinting().create().toJson(responseBody));
+                if (verbose) {
+                    System.out.println(prettyGson.toJson(responseBody));
                 }
                 if (!responseBody.get("ok").getAsBoolean()) {
                     System.err.println(responseBody);
@@ -116,56 +120,119 @@ public class Main {
                     JsonObject jsonObject = (JsonObject) jsonElement;
                     offset = Math.max(jsonObject.get("update_id").getAsInt(), offset);
 
-
                     JsonObject message = jsonObject.getAsJsonObject("message");
 
-                    if(message!=null) {
+                    if (message != null) {
                         if (checkGroupInclude.test(message.getAsJsonObject("chat"))) {
 
-                            boolean deleteMessage = true;
-
+                            // check service message
                             if (message.has("new_chat_members") || message.has("left_chat_member")) {
-                                deleteMessage = deleteServiceMessage;
-                            } else if (message.has("text") && !message.has("reply_to_message")) {
+                                if (deleteServiceMessage) deleteMessage(message);
+                                if (verbose) System.out.println(prettyGson.toJson(message));
+                                continue;
+                            }
+
+                            // check whiteList message
+                            if (checkUserWhitelistInclude.test(message.getAsJsonObject("from"))) {
+                                // if count
+                                if (!message.has("text")) continue;
+                                String text = message.get("text").getAsString();
+                                if (text.startsWith("0x")) text = text.substring(2);
+                                long currentCount;
                                 try {
-                                    String text = message.get("text").getAsString();
-                                    if(text.startsWith("0x"))text = text.substring(2);
-                                    long currentCount = Long.parseLong(text, 16);
-                                    String currentCounterID = message.getAsJsonObject("from").get("id").getAsString();
-                                    if (currentCount - latestCount == 1 && !currentCounterID.equals(latestCounterID)) {
-                                        latestCount++;
-                                        latestCounterID = currentCounterID;
-                                        deleteMessage = false;
-                                        if(verbose){
-                                            System.out.println("counted to 0x"+ Long.toString(latestCount,16));
-                                            System.out.println("latest Counter id: "+latestCounterID);
+                                    currentCount = Long.parseLong(text, 16);
+                                } catch (NumberFormatException ignore) {
+                                    continue;
+                                }
+                                String chatID = message.getAsJsonObject("chat").get("id").getAsString();
+                                String currentCounterID = message.getAsJsonObject("from").get("id").getAsString();
+
+                                // check if group init
+                                if (latestCounts.containsKey(chatID)) {
+
+                                    if (checkDelta(currentCount, chatID)) {
+                                        // is normal  count, ignore.
+                                        latestCounts.put(chatID, currentCount);
+                                        latestCounterIDs.put(chatID, currentCounterID);
+                                        if (verbose) {
+                                            System.out.println(chatID + " counted to 0x" + Long.toString(currentCount, 16));
+                                            System.out.println("latest Counter id: " + currentCounterID + " (whitelist user)");
+                                        }
+                                    } else {
+                                        // delete wrong count
+                                        deleteMessage(message);
+                                        if (verbose) {
+                                            System.err.println("whitelist user " + message.getAsJsonObject("from").get("id").getAsString() + " counts wrong!");
+                                            System.err.println("latest is 0x" + Long.toString(latestCounts.get(chatID), 16) + " but he count 0x" + Long.toString(currentCount, 16));
                                         }
                                     }
-                                } catch (NumberFormatException ignore) {
+                                } else {
+                                    //init
+                                    if (verbose)
+                                        System.out.println("(whitelist user) inited group " + chatID + ", count to 0x" + Long.toString(currentCount, 16));
+                                    latestCounts.put(chatID, currentCount);
+                                    latestCounterIDs.put(chatID, message.getAsJsonObject("from").get("id").getAsString());
                                 }
+                                continue;
                             }
 
-                            if (checkUserWhitelistInclude.test(message.getAsJsonObject("from")))
-                                deleteMessage = false;
+                            // Easter egg: @xierch can send "啊啊啊" at ANY times
+                            if (
+                                    message.getAsJsonObject("from").has("username") &&
+                                            message.getAsJsonObject("from").get("username").getAsString().equals("xierch") &&
+                                            message.has("text") &&
+                                            message.get("text").getAsString().matches("啊*")
+                            ) {
+                                continue;
+                            }
 
-                            if (deleteMessage) {
+                            // check is normal text message
+                            if (message.has("text") && !message.has("reply_to_message")) {
+                                String text = message.get("text").getAsString();
+                                if (text.startsWith("0x")) text = text.substring(2);
+                                long currentCount;
+                                try {
+                                    currentCount = Long.parseLong(text, 16);
+                                } catch (NumberFormatException e) {
+                                    // not a number, delete.
+                                    deleteMessage(message);
+                                    continue;
+                                }
+
+                                String currentCounterID = message.getAsJsonObject("from").get("id").getAsString();
+                                String chatID = message.getAsJsonObject("chat").get("id").getAsString();
+
+                                if (checkDelta(currentCount, chatID) && !currentCounterID.equals(latestCounterIDs.get(chatID))) {
+                                    latestCounts.put(chatID, currentCount);
+                                    latestCounterIDs.put(chatID, currentCounterID);
+                                    if (verbose) {
+                                        System.out.println(chatID + "counted to 0x" + Long.toString(currentCount, 16));
+                                        System.out.println("latest Counter id: " + currentCounterID);
+                                    }
+                                } else {
+                                    deleteMessage(message);
+                                }
+                            } else {
+                                // delete non-text message and replys
                                 deleteMessage(message);
                             }
+
                         }
-                    }else {
-                        if (jsonObject.has("edited_message")){
+                    } else {
+                        if (jsonObject.has("edited_message")) {
                             JsonObject editedMessage = jsonObject.getAsJsonObject("edited_message");
                             if (checkGroupInclude.test(editedMessage.getAsJsonObject("chat"))
                                     && !checkUserWhitelistInclude.test(editedMessage.getAsJsonObject("from"))) {
                                 deleteMessage(editedMessage);
                                 banUser(editedMessage);
+                                rollBackTags.put(editedMessage.getAsJsonObject("chat").get("id").getAsString(), true);
                             }
                         }
                     }
                 }
 
             } catch (IOException | NullPointerException e) {
-                if(verbose){
+                if (verbose) {
                     e.printStackTrace();
                 }
             }
@@ -190,11 +257,13 @@ public class Main {
     /**
      * split a string by "," or "，"
      * any of them must be
+     *
      * @return null if not a list.
      */
 
-    private static @Nullable String[] parseList(String string) {
-        if (!string.toLowerCase().matches("[a-z0-9_,，]")) return null;
+    private static @Nullable
+    String[] parseList(String string) {
+        if (!string.toLowerCase().matches("[@a-z0-9_,，]*")) return null;
         final String[] keys = string.split("[,，]");
         for (String key : keys) {
             if (!isNumber(key) && !isUsername(key)) {
@@ -205,7 +274,6 @@ public class Main {
     }
 
 
-
     private static Predicate<JsonObject> getCheckFunctionByArgument(String arg) {
         if (isNumber(arg)) return json -> arg.equals(json.get("id").getAsString());
         if (isUsername(arg)) {
@@ -213,12 +281,14 @@ public class Main {
             return json -> username.equalsIgnoreCase(json.get("username").getAsString());
         }
         final String[] keys = parseList(arg);
-        if(keys != null) {
+        if (keys != null) {
             final LinkedList<String> UIDs = new LinkedList<>();
             final LinkedList<String> usernames = new LinkedList<>();
             for (String key : keys) {
                 if (isNumber(key)) UIDs.add(key);
-                else if (isUsername(key)) usernames.add(key);
+                else if (isUsername(key)) usernames.add(
+                        key.startsWith("@") ? key.substring(1) : key
+                );
                 else throw new WTFException();
             }
 
@@ -242,7 +312,19 @@ public class Main {
         };
     }
 
-    private static void deleteMessage(JsonObject message){
+    private static boolean checkDelta(long current, String chatID) {
+        if (!latestCounts.containsKey(chatID)) return false;
+        long delta = current - latestCounts.get(chatID);
+
+        if (delta == 1) return true;
+        if (delta == 0 && rollBackTags.containsKey(chatID) && rollBackTags.get(chatID)) {
+            rollBackTags.put(chatID, false);
+            return true;
+        }
+        return false;
+    }
+
+    private static void deleteMessage(JsonObject message) {
         new Thread(() -> {
             boolean deleted = false;
             for (int i = 1; i <= 3; i++) {
@@ -269,22 +351,22 @@ public class Main {
                 } catch (IOException | NullPointerException | JsonSyntaxException e) {
                     if (verbose) {
                         System.err.println("trying to delete message failed(" + i + "/3): ");
-                        System.err.println(new GsonBuilder().setPrettyPrinting().create().toJson(message));
+                        System.err.println(prettyGson.toJson(message));
                         if (deleteResponseJson != null) {
                             System.err.println("return: ");
-                            System.err.println(new GsonBuilder().setPrettyPrinting().create().toJson(deleteResponseJson));
+                            System.err.println(prettyGson.toJson(deleteResponseJson));
                         }
                     }
                 }
             }
             if (!deleted) {
                 System.err.println("trying to delete message failed 3 times: ");
-                System.err.println(new GsonBuilder().setPrettyPrinting().create().toJson(message));
+                System.err.println(prettyGson.toJson(message));
             }
         }).start();
     }
 
-    private static void banUser(JsonObject message){
+    private static void banUser(JsonObject message) {
         new Thread(() -> {
             boolean banned = false;
             for (int i = 1; i <= 3; i++) {
@@ -314,19 +396,18 @@ public class Main {
                 } catch (IOException | NullPointerException | JsonSyntaxException e) {
                     if (verbose) {
                         System.err.println("trying to ban user failed(" + i + "/3): ");
-                        System.err.println(new GsonBuilder().setPrettyPrinting().create().toJson(message));
+                        System.err.println(prettyGson.toJson(message));
                         if (responseJson != null) {
                             System.err.println("return: ");
-                            System.err.println(new GsonBuilder().setPrettyPrinting().create().toJson(responseJson));
+                            System.err.println(prettyGson.toJson(responseJson));
                         }
                     }
                 }
             }
             if (!banned) {
                 System.err.println("trying to ban user failed 3 times: ");
-                System.err.println(new GsonBuilder().setPrettyPrinting().create().toJson(message));
+                System.err.println(prettyGson.toJson(message));
             }
         }).start();
     }
-
 }
