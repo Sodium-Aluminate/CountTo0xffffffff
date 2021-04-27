@@ -116,7 +116,7 @@ public class Main {
 
                 // handle Updates
 
-                for (JsonElement jsonElement : result) {
+                checkUpdateLoop: for (JsonElement jsonElement : result) {
                     JsonObject jsonObject = (JsonObject) jsonElement;
                     offset = Math.max(jsonObject.get("update_id").getAsInt(), offset);
 
@@ -140,7 +140,7 @@ public class Main {
                                 if (text.startsWith("0x")) text = text.substring(2);
                                 long currentCount;
                                 try {
-                                    currentCount = Long.parseLong(text, 16);
+                                    currentCount = Long.parseLong(text.toLowerCase(), 16);
                                 } catch (NumberFormatException ignore) {
                                     continue;
                                 }
@@ -188,16 +188,39 @@ public class Main {
 
                             // check is normal text message
                             if (message.has("text") && !message.has("reply_to_message")) {
+
+                                // delete link, mention, and strikethrough
+                                if(message.has("entities")){
+                                    JsonArray entities = message.getAsJsonArray("entities");
+                                    for (JsonElement json:entities) {
+                                        for (String s: new String[]{"mention", "text_link", "strikethrough"}) {
+                                            if(s.equals(((JsonObject) json).get("type").getAsString())){
+                                                deleteMessage(message);
+                                                continue checkUpdateLoop;
+                                            }
+                                        }
+                                    }
+                                }
+
                                 String text = message.get("text").getAsString();
+
+                                // allow "0x"
                                 if (text.startsWith("0x")) text = text.substring(2);
+
+                                // 0086 or +0086 is not allowed. see: https://t.me/CountTo0xffffffff/252
+                                if(text.startsWith("0")||text.startsWith("+")){
+                                    deleteMessage(message);
+                                    continue;
+                                }
                                 long currentCount;
                                 try {
-                                    currentCount = Long.parseLong(text, 16);
+                                    currentCount = Long.parseLong(text.toLowerCase(), 16);
                                 } catch (NumberFormatException e) {
                                     // not a number, delete.
                                     deleteMessage(message);
                                     continue;
                                 }
+
 
                                 String currentCounterID = message.getAsJsonObject("from").get("id").getAsString();
                                 String chatID = message.getAsJsonObject("chat").get("id").getAsString();
