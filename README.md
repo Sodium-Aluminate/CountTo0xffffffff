@@ -1,6 +1,8 @@
 # HEX Counter
 自动删掉群内除了数数之外的消息。
 
+数数群：[Telegram](https://t.me/CountTo0xffffffff)
+
 ## 滥权
 * 相比隔壁[乌鸦长老](https://github.com/sorz/ahgroupbot)不会线程堵塞，防止刷屏时删除消息滞后的困扰。
 * 禁止修改旧消息，否则在删除消息的同时禁言用户。
