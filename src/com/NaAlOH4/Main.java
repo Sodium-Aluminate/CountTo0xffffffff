@@ -298,11 +298,15 @@ public class Main {
 
 
     private static Predicate<JsonObject> getCheckFunctionByArgument(String arg) {
+        // only one arg
         if (isNumber(arg)) return json -> arg.equals(json.get("id").getAsString());
         if (isUsername(arg)) {
             final String username = arg.substring((arg.startsWith("@")) ? 1 : 0);
-            return json -> username.equalsIgnoreCase(json.get("username").getAsString());
+            return json ->
+                json.has("username") && username.equalsIgnoreCase(json.get("username").getAsString());
         }
+
+        // more than one arg
         final String[] keys = parseList(arg);
         if (keys != null) {
             final LinkedList<String> UIDs = new LinkedList<>();
@@ -327,11 +331,11 @@ public class Main {
             };
         }
 
+        // regex
         final Pattern pattern = Pattern.compile(arg);
         return json -> {
             if (pattern.matcher(json.get("id").getAsString()).matches()) return true;
-            if (!json.has("username")) return false;
-            return pattern.matcher(json.get("username").getAsString()).matches();
+            return json.has("username") && pattern.matcher(json.get("username").getAsString()).matches();
         };
     }
 
